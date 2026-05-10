@@ -2,6 +2,7 @@
 .github
 .ddev
 .DS_Store
+**/.DS_Store
 .php-cs-fixer.cache
 .phpunit.cache
 .vscode
@@ -19,6 +20,3 @@ src/data/cache/*
 !src/data/cache/.gitkeep
 src/data/log/*
 !src/data/log/index.html
-
-tests
-tests-legacy

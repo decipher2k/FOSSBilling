@@ -1,16 +1,17 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.18
 
 ARG PHP_VERSION=8.5
 ARG NODE_VERSION=24
 
 FROM php:${PHP_VERSION}-apache AS php-base
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
+RUN set -eux; \
+  savedAptMark="$(apt-mark showmanual)"; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends \
     ca-certificates \
     cron \
     curl \
-    git \
     libbz2-dev \
     libfreetype6-dev \
     libicu-dev \
@@ -18,23 +19,55 @@ RUN apt-get update \
     libpng-dev \
     libzip-dev \
     unzip \
-    zlib1g-dev \
-  && docker-php-ext-configure gd --with-freetype --with-jpeg \
-  && docker-php-ext-install -j"$(nproc)" bz2 gd intl pdo_mysql zip \
-  && a2enmod rewrite \
-  && apt-get clean \
-  && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+    zlib1g-dev; \
+  docker-php-ext-configure gd --with-freetype --with-jpeg; \
+  docker-php-ext-install -j"$(nproc)" bz2 gd intl pdo_mysql zip; \
+  a2enmod rewrite; \
+  apt-mark auto '.*' > /dev/null; \
+  apt-mark manual \
+    ${savedAptMark} \
+    ca-certificates \
+    cron \
+    curl \
+    unzip; \
+  find /usr/local -type f \( -perm /0111 -o -name '*.so' \) -exec sh -c 'ldd "$@" 2>/dev/null' sh '{}' + \
+    | awk 'NF == 4 && $2 == "=>" { print $3 } NF == 2 && $1 ~ /^\// { print $1 }' \
+    | sort -u \
+    | while read -r library; do \
+        library="$(readlink -e "${library}")"; \
+        dpkg-query --search "${library}" 2>/dev/null | grep -v '^diversion ' | head -n1 | cut -d: -f1; \
+      done \
+    | sort -u \
+    | xargs -r apt-mark manual; \
+  apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
+  apt-get clean; \
+  rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
-FROM php-base AS php-vendor
+FROM php-base AS composer-base
 
 WORKDIR /app
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
+FROM composer-base AS php-vendor
+
 COPY composer.json composer.lock ./
 
 RUN --mount=type=cache,target=/tmp/composer-cache \
   COMPOSER_CACHE_DIR=/tmp/composer-cache \
   composer install --prefer-dist --no-dev --optimize-autoloader --no-interaction --no-progress
+
+FROM composer-base AS php-dev-vendor
+COPY composer.json composer.lock ./
+
+RUN --mount=type=cache,target=/tmp/composer-cache \
+  COMPOSER_CACHE_DIR=/tmp/composer-cache \
+  composer install --prefer-dist --optimize-autoloader --no-interaction --no-progress
 
 FROM node:${NODE_VERSION}-bookworm-slim AS frontend-assets
 
@@ -46,7 +79,9 @@ COPY src/themes/huraga/package.json src/themes/huraga/package.json
 
 RUN --mount=type=cache,target=/root/.npm npm ci
 
-COPY src ./src
+COPY src/themes/admin_default ./src/themes/admin_default
+COPY src/themes/huraga ./src/themes/huraga
+COPY src/modules ./src/modules
 
 RUN NODE_ENV=production npm run build
 
@@ -57,7 +92,9 @@ WORKDIR /app
 ARG FOSSBILLING_VERSION=0.0.1
 ARG FOSSBILLING_VERSION_TRUNCATE=0
 ARG SENTRY_DSN=
+ARG INSTALL_TRANSLATIONS=true
 ARG TRANSLATIONS_URL=https://github.com/FOSSBilling/locale/releases/latest/download/translations.zip
+ARG TRANSLATIONS_SHA256=
 
 COPY src ./src
 COPY README.md LICENSE ./src/
@@ -67,14 +104,23 @@ COPY --from=frontend-assets /app/src/themes/huraga/assets/build ./src/themes/hur
 
 RUN set -eux; \
   mkdir -p ./src/locale; \
-  curl -fsSL "${TRANSLATIONS_URL}" -o /tmp/translations.zip; \
-  unzip -oq /tmp/translations.zip -d ./src/locale; \
-  rm /tmp/translations.zip; \
+  if [ "${INSTALL_TRANSLATIONS}" = "true" ]; then \
+    curl -fsSL "${TRANSLATIONS_URL}" -o /tmp/translations.zip; \
+    if [ -n "${TRANSLATIONS_SHA256}" ]; then \
+      echo "${TRANSLATIONS_SHA256}  /tmp/translations.zip" | sha256sum -c -; \
+    fi; \
+    unzip -oq /tmp/translations.zip -d ./src/locale; \
+    rm /tmp/translations.zip; \
+  fi; \
   FOSSBILLING_VERSION="${FOSSBILLING_VERSION}" \
   FOSSBILLING_VERSION_TRUNCATE="${FOSSBILLING_VERSION_TRUNCATE}" \
   SENTRY_DSN="${SENTRY_DSN}" \
   php -r '$version = getenv("FOSSBILLING_VERSION") ?: "0.0.1"; $truncate = (int) (getenv("FOSSBILLING_VERSION_TRUNCATE") ?: 0); if ($truncate > 0) { $version = substr($version, 0, $truncate); } $versionFile = "./src/library/FOSSBilling/Version.php"; file_put_contents($versionFile, str_replace("0.0.1", $version, file_get_contents($versionFile))); $dsn = getenv("SENTRY_DSN"); if ($dsn !== false && $dsn !== "") { $sentryFile = "./src/library/FOSSBilling/SentryHelper.php"; file_put_contents($sentryFile, str_replace("--replace--this--during--release--process--", $dsn, file_get_contents($sentryFile))); }'; \
   chmod -R u=rwX,go=rX ./src
+
+FROM scratch AS release-artifact
+
+COPY --from=release-tree /app/src /
 
 FROM php-base AS runtime
 
@@ -91,3 +137,18 @@ RUN set -eux; \
   rm /tmp/www-data.cron
 
 CMD ["sh", "-c", "cron & exec apache2-foreground"]
+
+FROM runtime AS test
+
+WORKDIR /workspace
+
+COPY --from=release-tree /app/src ./src
+COPY --from=php-dev-vendor /app/src/vendor ./src/vendor
+COPY composer.json composer.lock phpstan.neon phpstan-baseline.neon phpunit.xml.dist phpunit-live.xml ./
+COPY tests ./tests
+COPY tests-legacy ./tests-legacy
+
+RUN set -eux; \
+  php -r '$config = require "./src/config-sample.php"; file_put_contents("./src/config.php", "<?php\nreturn " . var_export($config, true) . ";\n");'; \
+  mkdir -p ./src/data/cache ./src/data/log ./src/data/uploads; \
+  chown -R www-data:www-data ./src/data ./src/config.php

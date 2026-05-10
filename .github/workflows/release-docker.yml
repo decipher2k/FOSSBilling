@@ -5,6 +5,10 @@ on:
     types: 
       - published
 
+concurrency:
+  group: ${{ github.workflow }}-dockerhub
+  cancel-in-progress: false
+
 jobs:
   # Latest release is identified by branch/tag SemVer,
   # not the 'Set as the latest release' GitHub option.
@@ -13,6 +17,7 @@ jobs:
     permissions: 
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       is_latest: ${{ steps.compare-latest.outputs.is_latest }}
     steps:
@@ -28,9 +33,9 @@ jobs:
         id: compare-latest
         run: |
           if [ "${{ github.ref_name }}" = "${{ steps.get-latest.outputs.release }}" ]; then
-            echo "is_latest=true" >> $GITHUB_OUTPUT
+            echo "is_latest=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "is_latest=false" >> $GITHUB_OUTPUT
+            echo "is_latest=false" >> "${GITHUB_OUTPUT}"
           fi
 
   deploy-release-docker:
@@ -51,6 +56,7 @@ jobs:
       platforms: linux/amd64,linux/arm64
       cache: true
       cache-mode: max
+      cache-scope: fossbilling-release-image
       sbom: true
       set-meta-labels: true
       set-meta-annotations: true
